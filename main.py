@@ -14,9 +14,6 @@ from discord.ui import Button, View
 from keep_alive import keep_alive
 
 
-MATCH_SIZE = 8
-
-
 @dataclass(frozen=True)
 class QueueConfig:
     queue_voice_channel_id: int
@@ -63,6 +60,9 @@ def _env_int(name: str, default: int) -> int:
     if raw is None or raw.strip() == "":
         return default
     return int(raw)
+
+
+MATCH_SIZE = _env_int("MATCH_SIZE", 8)
 
 
 def load_queue_configs() -> dict[int, QueueConfig]:
@@ -419,7 +419,7 @@ async def start_match_if_ready(guild: discord.Guild, queue_channel: discord.Voic
 
     vote_view = CaptainVoteView(key, session_id, guild, session.player_ids)
     msg = await match_text_channel.send(
-        f"🔥 **8 players found** in `{queue_channel.name}`.\n\n"
+        f"🔥 **{MATCH_SIZE} players found** in `{queue_channel.name}`.\n\n"
         f"Each player vote for **2 captains** (2 clicks total). Voting ends in **{VOTE_SECONDS}s**.\n\n"
         f"Players: {render_players(guild, session.player_ids)}",
         view=vote_view,
