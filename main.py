@@ -16,7 +16,7 @@ from keep_alive import keep_alive
 
 @dataclass(frozen=True)
 class QueueConfig:
-    queue_voice_channel_id: int
+    queue_text_channel_id: int
     match_text_channel_id: int
     category_id: Optional[int] = None
     name: Optional[str] = None
@@ -25,7 +25,7 @@ class QueueConfig:
 @dataclass
 class MatchSession:
     guild_id: int
-    queue_voice_channel_id: int
+    queue_text_channel_id: int
     match_text_channel_id: int
     category_id: Optional[int]
     session_id: str
@@ -55,6 +55,18 @@ class MatchSession:
     result_started_ts: Optional[float] = None
 
 
+@dataclass
+class QueueState:
+    guild_id: int
+    queue_text_channel_id: int
+    match_text_channel_id: int
+    category_id: Optional[int]
+    name: Optional[str]
+    current_message_id: Optional[int] = None
+    queued_user_ids: list[int] = field(default_factory=list)
+    active_match_participants: set[int] = field(default_factory=set)
+
+
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
@@ -82,19 +94,19 @@ def load_queue_configs() -> dict[int, QueueConfig]:
     for idx, item in enumerate(data):
         if not isinstance(item, dict):
             raise RuntimeError(f"QUEUES_JSON[{idx}] must be an object.")
-        if "queue_voice_channel_id" not in item or "match_text_channel_id" not in item:
+        if "queue_text_channel_id" not in item or "match_text_channel_id" not in item:
             raise RuntimeError(
-                f"QUEUES_JSON[{idx}] must include queue_voice_channel_id and match_text_channel_id."
+                f"QUEUES_JSON[{idx}] must include queue_text_channel_id and match_text_channel_id."
             )
-        qid = int(item["queue_voice_channel_id"])
+        qid = int(item["queue_text_channel_id"])
         mid = int(item["match_text_channel_id"])
         cid = int(item["category_id"]) if "category_id" in item and item["category_id"] is not None else None
         name = str(item["name"]) if "name" in item and item["name"] is not None else None
 
         if qid in configs:
-            raise RuntimeError(f"Duplicate queue_voice_channel_id in QUEUES_JSON: {qid}")
+            raise RuntimeError(f"Duplicate queue_text_channel_id in QUEUES_JSON: {qid}")
         configs[qid] = QueueConfig(
-            queue_voice_channel_id=qid,
+            queue_text_channel_id=qid,
             match_text_channel_id=mid,
             category_id=cid,
             name=name,
@@ -110,31 +122,30 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 QUEUE_CONFIGS: dict[int, QueueConfig] = {}
-ACTIVE_SESSIONS: dict[tuple[int, int], MatchSession] = {}
-SESSION_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
+QUEUE_STATES: dict[tuple[int, int], QueueState] = {}
+ACTIVE_SESSIONS: dict[str, MatchSession] = {}
+QUEUE_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
+SESSION_LOCKS: dict[str, asyncio.Lock] = {}
 
 VOTE_SECONDS = _env_int("VOTE_SECONDS", 60)
 DRAFT_SECONDS = _env_int("DRAFT_SECONDS", 180)
 RESULT_VOTE_SECONDS = _env_int("RESULT_VOTE_SECONDS", 60)
 
 
-def get_session_key(guild_id: int, queue_voice_channel_id: int) -> tuple[int, int]:
-    return (guild_id, queue_voice_channel_id)
-
-
-def get_lock(key: tuple[int, int]) -> asyncio.Lock:
-    lock = SESSION_LOCKS.get(key)
+def get_queue_lock(key: tuple[int, int]) -> asyncio.Lock:
+    lock = QUEUE_LOCKS.get(key)
     if lock is None:
         lock = asyncio.Lock()
-        SESSION_LOCKS[key] = lock
+        QUEUE_LOCKS[key] = lock
     return lock
 
 
-async def set_queue_locked(queue_channel: discord.VoiceChannel, locked: bool) -> None:
-    default_role = queue_channel.guild.default_role
-    overwrite = queue_channel.overwrites_for(default_role)
-    overwrite.connect = False if locked else None
-    await queue_channel.set_permissions(default_role, overwrite=overwrite)
+def get_session_lock(session_id: str) -> asyncio.Lock:
+    lock = SESSION_LOCKS.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        SESSION_LOCKS[session_id] = lock
+    return lock
 
 
 def choose_two_captains(
@@ -179,22 +190,23 @@ def render_players(guild: discord.Guild, ids: list[int]) -> str:
 
 
 class VoteCaptainButton(Button):
-    def __init__(self, session_key: tuple[int, int], session_id: str, candidate_id: int, label: str):
+    def __init__(self, session_id: str, candidate_id: int, label: str):
         super().__init__(
             style=discord.ButtonStyle.primary,
             label=label,
             custom_id=f"capvote:{session_id}:{candidate_id}",
         )
-        self.session_key = session_key
+        self.session_id = session_id
         self.candidate_id = candidate_id
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        session = ACTIVE_SESSIONS.get(self.session_key)
+        session = ACTIVE_SESSIONS.get(self.session_id)
         if session is None:
             await interaction.response.send_message("This match is no longer active.", ephemeral=True)
             return
 
-        async with get_lock(self.session_key):
+        should_finalize = False
+        async with get_session_lock(self.session_id):
             if session.phase != "captain_vote":
                 await interaction.response.send_message("Captain voting is closed.", ephemeral=True)
                 return
@@ -221,13 +233,15 @@ class VoteCaptainButton(Button):
                 await interaction.response.send_message("Vote recorded. You are done voting.", ephemeral=True)
 
             if all(len(session.captain_votes.get(pid, [])) >= 2 for pid in session.player_ids):
-                await finalize_captain_vote(self.session_key, reason="all_votes_in")
+                should_finalize = True
+
+        if should_finalize:
+            await finalize_captain_vote(self.session_id, reason="all_votes_in")
 
 
 class CaptainVoteView(View):
-    def __init__(self, session_key: tuple[int, int], session_id: str, guild: discord.Guild, player_ids: list[int]):
+    def __init__(self, session_id: str, guild: discord.Guild, player_ids: list[int]):
         super().__init__(timeout=None)
-        self.session_key = session_key
         self.session_id = session_id
 
         for pid in player_ids:
@@ -235,26 +249,27 @@ class CaptainVoteView(View):
             label = member.display_name if member else str(pid)
             if len(label) > 80:
                 label = label[:77] + "..."
-            self.add_item(VoteCaptainButton(session_key, session_id, pid, label))
+            self.add_item(VoteCaptainButton(session_id, pid, label))
 
 
 class DraftPickButton(Button):
-    def __init__(self, session_key: tuple[int, int], session_id: str, pick_id: int, label: str):
+    def __init__(self, session_id: str, pick_id: int, label: str):
         super().__init__(
             style=discord.ButtonStyle.success,
             label=label,
             custom_id=f"draftpick:{session_id}:{pick_id}",
         )
-        self.session_key = session_key
+        self.session_id = session_id
         self.pick_id = pick_id
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        session = ACTIVE_SESSIONS.get(self.session_key)
+        session = ACTIVE_SESSIONS.get(self.session_id)
         if session is None:
             await interaction.response.send_message("This match is no longer active.", ephemeral=True)
             return
 
-        async with get_lock(self.session_key):
+        allowed = False
+        async with get_session_lock(self.session_id):
             if session.phase != "draft":
                 await interaction.response.send_message("Drafting is not active.", ephemeral=True)
                 return
@@ -277,14 +292,16 @@ class DraftPickButton(Button):
                 await interaction.response.send_message("That player is no longer available.", ephemeral=True)
                 return
 
+            allowed = True
+
+        if allowed:
             await interaction.response.defer()
-            await apply_pick_and_advance(self.session_key, picked_id=self.pick_id)
+            await apply_pick_and_advance(self.session_id, picked_id=self.pick_id)
 
 
 class DraftPickView(View):
-    def __init__(self, session_key: tuple[int, int], session_id: str, guild: discord.Guild, remaining_ids: list[int]):
+    def __init__(self, session_id: str, guild: discord.Guild, remaining_ids: list[int]):
         super().__init__(timeout=None)
-        self.session_key = session_key
         self.session_id = session_id
 
         for pid in remaining_ids:
@@ -292,25 +309,25 @@ class DraftPickView(View):
             label = member.display_name if member else str(pid)
             if len(label) > 80:
                 label = label[:77] + "..."
-            self.add_item(DraftPickButton(session_key, session_id, pid, label))
+            self.add_item(DraftPickButton(session_id, pid, label))
 
 
 class StartResultVoteButton(Button):
-    def __init__(self, session_key: tuple[int, int], session_id: str):
+    def __init__(self, session_id: str):
         super().__init__(
             style=discord.ButtonStyle.primary,
             label="Start winner vote",
             custom_id=f"startresult:{session_id}",
         )
-        self.session_key = session_key
+        self.session_id = session_id
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        session = ACTIVE_SESSIONS.get(self.session_key)
+        session = ACTIVE_SESSIONS.get(self.session_id)
         if session is None:
             await interaction.response.send_message("This match is no longer active.", ephemeral=True)
             return
 
-        async with get_lock(self.session_key):
+        async with get_session_lock(self.session_id):
             if session.phase != "in_match":
                 await interaction.response.send_message("Winner voting isn’t available right now.", ephemeral=True)
                 return
@@ -324,34 +341,34 @@ class StartResultVoteButton(Button):
 
         await interaction.response.send_message(
             "Vote which team won:",
-            view=ResultVoteView(self.session_key, session.session_id),
+            view=ResultVoteView(session.session_id),
         )
-        bot.loop.create_task(result_vote_timeout_task(self.session_key))
+        bot.loop.create_task(result_vote_timeout_task(self.session_id))
 
 
 class StartResultVoteView(View):
-    def __init__(self, session_key: tuple[int, int], session_id: str):
+    def __init__(self, session_id: str):
         super().__init__(timeout=None)
-        self.add_item(StartResultVoteButton(session_key, session_id))
+        self.add_item(StartResultVoteButton(session_id))
 
 
 class ResultVoteButton(Button):
-    def __init__(self, session_key: tuple[int, int], session_id: str, team: int, label: str):
+    def __init__(self, session_id: str, team: int, label: str):
         super().__init__(
             style=discord.ButtonStyle.success if team == 1 else discord.ButtonStyle.danger,
             label=label,
             custom_id=f"result:{session_id}:{team}",
         )
-        self.session_key = session_key
+        self.session_id = session_id
         self.team = team
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        session = ACTIVE_SESSIONS.get(self.session_key)
+        session = ACTIVE_SESSIONS.get(self.session_id)
         if session is None:
             await interaction.response.send_message("This match is no longer active.", ephemeral=True)
             return
 
-        async with get_lock(self.session_key):
+        async with get_session_lock(self.session_id):
             if session.phase != "result_vote":
                 await interaction.response.send_message("Winner voting is closed.", ephemeral=True)
                 return
@@ -372,102 +389,228 @@ class ResultVoteButton(Button):
         )
 
         if done:
-            await finalize_result_vote(self.session_key, reason="all_votes_in")
+            await finalize_result_vote(self.session_id, reason="all_votes_in")
 
 
 class ResultVoteView(View):
-    def __init__(self, session_key: tuple[int, int], session_id: str):
+    def __init__(self, session_id: str):
         super().__init__(timeout=None)
-        self.add_item(ResultVoteButton(session_key, session_id, 1, "Team 1 won"))
-        self.add_item(ResultVoteButton(session_key, session_id, 2, "Team 2 won"))
+        self.add_item(ResultVoteButton(session_id, 1, "Team 1 won"))
+        self.add_item(ResultVoteButton(session_id, 2, "Team 2 won"))
 
 
-async def start_match_if_ready(guild: discord.Guild, queue_channel: discord.VoiceChannel) -> None:
-    cfg = QUEUE_CONFIGS.get(queue_channel.id)
-    if cfg is None:
+def format_queue_message(state: QueueState) -> str:
+    title = state.name or "8s Queue"
+    count = len(state.queued_user_ids)
+    queued = " ".join(f"<@{uid}>" for uid in state.queued_user_ids) or "(empty)"
+    return (
+        f"**{title}** ({count}/{MATCH_SIZE})\n"
+        f"Click **Join Queue** to enter and **Leave Queue** to exit.\n\n"
+        f"Queued:\n{queued}"
+    )
+
+
+class QueueJoinButton(Button):
+    def __init__(self, queue_key: tuple[int, int]):
+        super().__init__(
+            style=discord.ButtonStyle.success,
+            label="Join Queue",
+            custom_id=f"queue:join:{queue_key[0]}:{queue_key[1]}",
+        )
+        self.queue_key = queue_key
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or interaction.channel is None:
+            await interaction.response.send_message("Queues only work inside servers.", ephemeral=True)
+            return
+
+        state = QUEUE_STATES.get(self.queue_key)
+        if state is None:
+            await interaction.response.send_message("This queue is not configured.", ephemeral=True)
+            return
+
+        user_id = interaction.user.id
+        if interaction.user.bot:
+            await interaction.response.send_message("Bots cannot join the queue.", ephemeral=True)
+            return
+
+        start_match_player_ids: Optional[list[int]] = None
+
+        async with get_queue_lock(self.queue_key):
+            if user_id in state.active_match_participants:
+                await interaction.response.send_message("You’re currently in an active match for this queue.", ephemeral=True)
+                return
+
+            if user_id in state.queued_user_ids:
+                await interaction.response.send_message("You’re already in the queue.", ephemeral=True)
+                return
+
+            if len(state.queued_user_ids) >= MATCH_SIZE:
+                await interaction.response.send_message("This queue is full. Please use the newest queue message.", ephemeral=True)
+                return
+
+            state.queued_user_ids.append(user_id)
+
+            if len(state.queued_user_ids) >= MATCH_SIZE:
+                start_match_player_ids = state.queued_user_ids[:MATCH_SIZE]
+                state.queued_user_ids = state.queued_user_ids[MATCH_SIZE:]
+                state.active_match_participants.update(start_match_player_ids)
+
+        # Update current queue message
+        await interaction.response.defer()
+        try:
+            await interaction.message.edit(content=format_queue_message(state), view=QueueView(self.queue_key))
+        except discord.HTTPException:
+            pass
+
+        # If we filled, lock the old message and post a new one immediately.
+        if start_match_player_ids is not None:
+            try:
+                await interaction.message.edit(
+                    content=(
+                        f"✅ Queue filled ({MATCH_SIZE}/{MATCH_SIZE}). Starting match now…\n\n"
+                        f"Players:\n{' '.join(f'<@{uid}>' for uid in start_match_player_ids)}"
+                    ),
+                    view=None,
+                )
+            except discord.HTTPException:
+                pass
+
+            # Post new queue message right away.
+            channel = interaction.channel
+            if isinstance(channel, discord.TextChannel):
+                async with get_queue_lock(self.queue_key):
+                    state.current_message_id = None
+                    msg = await channel.send(content=format_queue_message(state), view=QueueView(self.queue_key))
+                    state.current_message_id = msg.id
+
+            bot.loop.create_task(start_match_from_queue(state, start_match_player_ids))
+
+
+class QueueLeaveButton(Button):
+    def __init__(self, queue_key: tuple[int, int]):
+        super().__init__(
+            style=discord.ButtonStyle.secondary,
+            label="Leave Queue",
+            custom_id=f"queue:leave:{queue_key[0]}:{queue_key[1]}",
+        )
+        self.queue_key = queue_key
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("Queues only work inside servers.", ephemeral=True)
+            return
+
+        state = QUEUE_STATES.get(self.queue_key)
+        if state is None:
+            await interaction.response.send_message("This queue is not configured.", ephemeral=True)
+            return
+
+        user_id = interaction.user.id
+        changed = False
+        async with get_queue_lock(self.queue_key):
+            if user_id in state.queued_user_ids:
+                state.queued_user_ids = [uid for uid in state.queued_user_ids if uid != user_id]
+                changed = True
+
+        if not changed:
+            await interaction.response.send_message("You are not currently in the queue.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        try:
+            await interaction.message.edit(content=format_queue_message(state), view=QueueView(self.queue_key))
+        except discord.HTTPException:
+            pass
+
+
+class QueueView(View):
+    def __init__(self, queue_key: tuple[int, int]):
+        super().__init__(timeout=None)
+        self.add_item(QueueJoinButton(queue_key))
+        self.add_item(QueueLeaveButton(queue_key))
+
+
+async def start_match_from_queue(state: QueueState, player_ids: list[int]) -> None:
+    guild = bot.get_guild(state.guild_id)
+    if guild is None:
+        # Release players back into queue eligibility.
+        async with get_queue_lock((state.guild_id, state.queue_text_channel_id)):
+            state.active_match_participants.difference_update(player_ids)
         return
 
-    key = get_session_key(guild.id, queue_channel.id)
-    if key in ACTIVE_SESSIONS:
-        return
-
-    players = [m for m in queue_channel.members if not m.bot]
-    if len(players) != MATCH_SIZE:
+    match_text_channel = guild.get_channel(state.match_text_channel_id)
+    if not isinstance(match_text_channel, discord.TextChannel):
+        async with get_queue_lock((state.guild_id, state.queue_text_channel_id)):
+            state.active_match_participants.difference_update(player_ids)
         return
 
     session_id = uuid.uuid4().hex[:6]
     session = MatchSession(
         guild_id=guild.id,
-        queue_voice_channel_id=queue_channel.id,
-        match_text_channel_id=cfg.match_text_channel_id,
-        category_id=cfg.category_id,
+        queue_text_channel_id=state.queue_text_channel_id,
+        match_text_channel_id=state.match_text_channel_id,
+        category_id=state.category_id,
         session_id=session_id,
-        player_ids=[m.id for m in players],
+        player_ids=player_ids,
     )
-    ACTIVE_SESSIONS[key] = session
-    get_lock(key)
+    ACTIVE_SESSIONS[session_id] = session
+    get_session_lock(session_id)
 
-    try:
-        await set_queue_locked(queue_channel, True)
-    except discord.Forbidden:
-        pass
+    queue_channel = guild.get_channel(state.queue_text_channel_id)
+    queue_name = queue_channel.mention if isinstance(queue_channel, discord.TextChannel) else "the queue"
 
-    match_text_channel = guild.get_channel(cfg.match_text_channel_id)
-    if not isinstance(match_text_channel, discord.TextChannel):
-        await cancel_session(key, reason="invalid_match_text_channel")
-        return
-
-    vote_view = CaptainVoteView(key, session_id, guild, session.player_ids)
+    vote_view = CaptainVoteView(session_id, guild, session.player_ids)
     msg = await match_text_channel.send(
-        f"🔥 **{MATCH_SIZE} players found** in `{queue_channel.name}`.\n\n"
+        f"🔥 **{MATCH_SIZE} players queued** in {queue_name}.\n\n"
         f"Each player vote for **2 captains** (2 clicks total). Voting ends in **{VOTE_SECONDS}s**.\n\n"
         f"Players: {render_players(guild, session.player_ids)}",
         view=vote_view,
     )
     session.vote_message_id = msg.id
 
-    bot.loop.create_task(captain_vote_timeout_task(key))
+    bot.loop.create_task(captain_vote_timeout_task(session_id))
 
 
-async def cancel_session(key: tuple[int, int], reason: str) -> None:
-    session = ACTIVE_SESSIONS.get(key)
+async def cancel_session(session_id: str, reason: str) -> None:
+    session = ACTIVE_SESSIONS.get(session_id)
     if session is None:
         return
 
     guild = bot.get_guild(session.guild_id)
     if guild is not None:
-        queue_channel = guild.get_channel(session.queue_voice_channel_id)
-        if isinstance(queue_channel, discord.VoiceChannel):
-            try:
-                await set_queue_locked(queue_channel, False)
-            except discord.Forbidden:
-                pass
-
         match_text = guild.get_channel(session.match_text_channel_id)
         if isinstance(match_text, discord.TextChannel):
-            await match_text.send(f"⚠️ Match cancelled (`{reason}`). Queue unlocked.")
+            await match_text.send(f"⚠️ Match cancelled (`{reason}`).")
+
+    queue_key = (session.guild_id, session.queue_text_channel_id)
+    state = QUEUE_STATES.get(queue_key)
+    if state is not None:
+        async with get_queue_lock(queue_key):
+            state.active_match_participants.difference_update(session.player_ids)
 
     await cleanup_voice_channels(session)
-    ACTIVE_SESSIONS.pop(key, None)
+    ACTIVE_SESSIONS.pop(session_id, None)
+    SESSION_LOCKS.pop(session_id, None)
 
 
-async def captain_vote_timeout_task(key: tuple[int, int]) -> None:
+async def captain_vote_timeout_task(session_id: str) -> None:
     await asyncio.sleep(VOTE_SECONDS)
-    await finalize_captain_vote(key, reason="timeout")
+    await finalize_captain_vote(session_id, reason="timeout")
 
 
-async def finalize_captain_vote(key: tuple[int, int], reason: str) -> None:
-    session = ACTIVE_SESSIONS.get(key)
+async def finalize_captain_vote(session_id: str, reason: str) -> None:
+    session = ACTIVE_SESSIONS.get(session_id)
     if session is None:
         return
 
-    async with get_lock(key):
+    async with get_session_lock(session_id):
         if session.phase != "captain_vote":
             return
 
         guild = bot.get_guild(session.guild_id)
         if guild is None:
-            await cancel_session(key, reason="guild_missing")
+            await cancel_session(session_id, reason="guild_missing")
             return
 
         captains, counts = choose_two_captains(session.player_ids, session.captain_votes)
@@ -494,11 +637,11 @@ async def finalize_captain_vote(key: tuple[int, int], reason: str) -> None:
 
     match_text = guild.get_channel(session.match_text_channel_id)
     if not isinstance(match_text, discord.TextChannel):
-        await cancel_session(key, reason="invalid_match_text_channel")
+        await cancel_session(session_id, reason="invalid_match_text_channel")
         return
 
     remaining_sorted = sorted(session.remaining_ids)
-    draft_view = DraftPickView(key, session.session_id, guild, remaining_sorted)
+    draft_view = DraftPickView(session.session_id, guild, remaining_sorted)
 
     team_to_pick = session.pick_order[session.pick_index]
     captain_id = session.captain_ids[team_to_pick - 1] if session.captain_ids else None
@@ -514,12 +657,12 @@ async def finalize_captain_vote(key: tuple[int, int], reason: str) -> None:
     )
     session.draft_message_id = msg.id
 
-    bot.loop.create_task(draft_timeout_task(key))
+    bot.loop.create_task(draft_timeout_task(session_id))
 
 
-async def draft_timeout_task(key: tuple[int, int]) -> None:
+async def draft_timeout_task(session_id: str) -> None:
     while True:
-        session = ACTIVE_SESSIONS.get(key)
+        session = ACTIVE_SESSIONS.get(session_id)
         if session is None:
             return
         if session.phase != "draft":
@@ -527,8 +670,8 @@ async def draft_timeout_task(key: tuple[int, int]) -> None:
 
         await asyncio.sleep(2)
         now = time.time()
-        async with get_lock(key):
-            session = ACTIVE_SESSIONS.get(key)
+        async with get_session_lock(session_id):
+            session = ACTIVE_SESSIONS.get(session_id)
             if session is None or session.phase != "draft":
                 return
             if not session.remaining_ids:
@@ -538,20 +681,20 @@ async def draft_timeout_task(key: tuple[int, int]) -> None:
 
             picked_id = random.choice(list(session.remaining_ids))
 
-        await apply_pick_and_advance(key, picked_id=picked_id, autopick=True)
+        await apply_pick_and_advance(session_id, picked_id=picked_id, autopick=True)
 
 
-async def apply_pick_and_advance(key: tuple[int, int], picked_id: int, autopick: bool = False) -> None:
-    session = ACTIVE_SESSIONS.get(key)
+async def apply_pick_and_advance(session_id: str, picked_id: int, autopick: bool = False) -> None:
+    session = ACTIVE_SESSIONS.get(session_id)
     if session is None:
         return
     guild = bot.get_guild(session.guild_id)
     if guild is None:
-        await cancel_session(key, reason="guild_missing")
+        await cancel_session(session_id, reason="guild_missing")
         return
 
-    async with get_lock(key):
-        session = ACTIVE_SESSIONS.get(key)
+    async with get_session_lock(session_id):
+        session = ACTIVE_SESSIONS.get(session_id)
         if session is None or session.phase != "draft":
             return
         if session.pick_index >= len(session.pick_order):
@@ -574,11 +717,11 @@ async def apply_pick_and_advance(key: tuple[int, int], picked_id: int, autopick:
 
     match_text = guild.get_channel(session.match_text_channel_id)
     if not isinstance(match_text, discord.TextChannel):
-        await cancel_session(key, reason="invalid_match_text_channel")
+        await cancel_session(session_id, reason="invalid_match_text_channel")
         return
 
     if session.draft_message_id is None:
-        await cancel_session(key, reason="missing_draft_message")
+        await cancel_session(session_id, reason="missing_draft_message")
         return
 
     try:
@@ -591,7 +734,7 @@ async def apply_pick_and_advance(key: tuple[int, int], picked_id: int, autopick:
 
     if session.phase != "in_match":
         remaining_sorted = sorted(session.remaining_ids)
-        draft_view = DraftPickView(key, session.session_id, guild, remaining_sorted)
+        draft_view = DraftPickView(session.session_id, guild, remaining_sorted)
 
         team_to_pick = session.pick_order[session.pick_index]
         captain_id = session.captain_ids[team_to_pick - 1] if session.captain_ids else None
@@ -624,21 +767,16 @@ async def apply_pick_and_advance(key: tuple[int, int], picked_id: int, autopick:
     else:
         await match_text.send(content)
 
-    await create_team_channels_and_move(key)
+    await create_team_channels_and_move(session_id)
 
 
-async def create_team_channels_and_move(key: tuple[int, int]) -> None:
-    session = ACTIVE_SESSIONS.get(key)
+async def create_team_channels_and_move(session_id: str) -> None:
+    session = ACTIVE_SESSIONS.get(session_id)
     if session is None:
         return
     guild = bot.get_guild(session.guild_id)
     if guild is None:
-        await cancel_session(key, reason="guild_missing")
-        return
-
-    queue_channel = guild.get_channel(session.queue_voice_channel_id)
-    if not isinstance(queue_channel, discord.VoiceChannel):
-        await cancel_session(key, reason="invalid_queue_channel")
+        await cancel_session(session_id, reason="guild_missing")
         return
 
     category: Optional[discord.CategoryChannel] = None
@@ -647,7 +785,13 @@ async def create_team_channels_and_move(key: tuple[int, int]) -> None:
         if isinstance(ch, discord.CategoryChannel):
             category = ch
     if category is None:
-        category = queue_channel.category
+        match_text = guild.get_channel(session.match_text_channel_id)
+        if isinstance(match_text, discord.TextChannel) and match_text.category is not None:
+            category = match_text.category
+    if category is None:
+        queue_text = guild.get_channel(session.queue_text_channel_id)
+        if isinstance(queue_text, discord.TextChannel) and queue_text.category is not None:
+            category = queue_text.category
 
     def overwrites_for_team(team_ids: list[int]) -> dict[Any, discord.PermissionOverwrite]:
         overwrites: dict[Any, discord.PermissionOverwrite] = {
@@ -675,10 +819,10 @@ async def create_team_channels_and_move(key: tuple[int, int]) -> None:
             overwrites=overwrites_for_team(session.team2_ids),
         )
     except discord.Forbidden:
-        await cancel_session(key, reason="missing_permissions_create_channels")
+        await cancel_session(session_id, reason="missing_permissions_create_channels")
         return
 
-    async with get_lock(key):
+    async with get_session_lock(session_id):
         session.team1_voice_channel_id = team1_chan.id
         session.team2_voice_channel_id = team2_chan.id
 
@@ -703,27 +847,28 @@ async def create_team_channels_and_move(key: tuple[int, int]) -> None:
             f"🎮 **Match started**\n"
             f"Team 1 VC: {team1_chan.mention}\n"
             f"Team 2 VC: {team2_chan.mention}\n\n"
+            f"If you weren’t moved automatically, join your team VC above.\n\n"
             f"When the match ends, click below to start the winner vote.",
-            view=StartResultVoteView(key, session.session_id),
+            view=StartResultVoteView(session.session_id),
         )
 
 
-async def result_vote_timeout_task(key: tuple[int, int]) -> None:
+async def result_vote_timeout_task(session_id: str) -> None:
     await asyncio.sleep(RESULT_VOTE_SECONDS)
-    await finalize_result_vote(key, reason="timeout")
+    await finalize_result_vote(session_id, reason="timeout")
 
 
-async def finalize_result_vote(key: tuple[int, int], reason: str) -> None:
-    session = ACTIVE_SESSIONS.get(key)
+async def finalize_result_vote(session_id: str, reason: str) -> None:
+    session = ACTIVE_SESSIONS.get(session_id)
     if session is None:
         return
     guild = bot.get_guild(session.guild_id)
     if guild is None:
-        await cancel_session(key, reason="guild_missing")
+        await cancel_session(session_id, reason="guild_missing")
         return
 
-    async with get_lock(key):
-        session = ACTIVE_SESSIONS.get(key)
+    async with get_session_lock(session_id):
+        session = ACTIVE_SESSIONS.get(session_id)
         if session is None:
             return
         if session.phase != "result_vote":
@@ -749,7 +894,7 @@ async def finalize_result_vote(key: tuple[int, int], reason: str) -> None:
             )
         await match_text.send(msg)
 
-    await end_match_and_cleanup(key)
+    await end_match_and_cleanup(session_id)
 
 
 async def cleanup_voice_channels(session: MatchSession) -> None:
@@ -768,13 +913,13 @@ async def cleanup_voice_channels(session: MatchSession) -> None:
                 pass
 
 
-async def end_match_and_cleanup(key: tuple[int, int]) -> None:
-    session = ACTIVE_SESSIONS.get(key)
+async def end_match_and_cleanup(session_id: str) -> None:
+    session = ACTIVE_SESSIONS.get(session_id)
     if session is None:
         return
     guild = bot.get_guild(session.guild_id)
     if guild is None:
-        ACTIVE_SESSIONS.pop(key, None)
+        ACTIVE_SESSIONS.pop(session_id, None)
         return
 
     # Disconnect any remaining users in temp channels, then delete channels.
@@ -791,37 +936,42 @@ async def end_match_and_cleanup(key: tuple[int, int]) -> None:
 
     await cleanup_voice_channels(session)
 
-    queue_channel = guild.get_channel(session.queue_voice_channel_id)
-    if isinstance(queue_channel, discord.VoiceChannel):
-        try:
-            await set_queue_locked(queue_channel, False)
-        except discord.Forbidden:
-            pass
+    queue_key = (session.guild_id, session.queue_text_channel_id)
+    state = QUEUE_STATES.get(queue_key)
+    if state is not None:
+        async with get_queue_lock(queue_key):
+            state.active_match_participants.difference_update(session.player_ids)
 
-    ACTIVE_SESSIONS.pop(key, None)
-
-
-@bot.event
-async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    # Leaving a configured queue during captain vote/draft cancels that queue's match.
-    if before.channel and isinstance(before.channel, discord.VoiceChannel) and before.channel.id in QUEUE_CONFIGS:
-        key = get_session_key(member.guild.id, before.channel.id)
-        session = ACTIVE_SESSIONS.get(key)
-        if session is not None and session.phase in {"captain_vote", "draft"} and member.id in session.player_ids:
-            # Re-check current non-bot members in queue channel.
-            players_now = [m for m in before.channel.members if not m.bot]
-            if len(players_now) < MATCH_SIZE:
-                await cancel_session(key, reason="player_left_queue")
-
-    # Joining a configured queue may trigger match start.
-    if after.channel and isinstance(after.channel, discord.VoiceChannel):
-        await start_match_if_ready(member.guild, after.channel)
+    ACTIVE_SESSIONS.pop(session_id, None)
+    SESSION_LOCKS.pop(session_id, None)
 
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (discord.py {discord.__version__})")
     print(f"Queues loaded: {len(QUEUE_CONFIGS)}")
+
+    if getattr(bot, "_queue_messages_posted", False):
+        return
+    bot._queue_messages_posted = True  # type: ignore[attr-defined]
+
+    for cfg in QUEUE_CONFIGS.values():
+        ch = bot.get_channel(cfg.queue_text_channel_id)
+        if not isinstance(ch, discord.TextChannel):
+            print(f"Queue text channel not found or not text: {cfg.queue_text_channel_id}")
+            continue
+
+        key = (ch.guild.id, ch.id)
+        state = QueueState(
+            guild_id=ch.guild.id,
+            queue_text_channel_id=ch.id,
+            match_text_channel_id=cfg.match_text_channel_id,
+            category_id=cfg.category_id,
+            name=cfg.name,
+        )
+        QUEUE_STATES[key] = state
+        msg = await ch.send(content=format_queue_message(state), view=QueueView(key))
+        state.current_message_id = msg.id
 
 
 def main():
