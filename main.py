@@ -588,6 +588,10 @@ async def start_match_from_queue(state: QueueState, player_ids: list[int]) -> No
         overwrites: dict[Any, discord.PermissionOverwrite] = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
         }
+        if guild.me is not None:
+            overwrites[guild.me] = discord.PermissionOverwrite(
+                view_channel=True, read_message_history=True, send_messages=True
+            )
         for pid in player_ids:
             m = guild.get_member(pid)
             if m is None:
