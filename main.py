@@ -17,7 +17,7 @@ from keep_alive import keep_alive
 @dataclass(frozen=True)
 class QueueConfig:
     queue_text_channel_id: int
-    match_text_channel_id: int
+    match_text_channel_id: Optional[int] = None  # None = bot creates temp channel per match and deletes after
     category_id: Optional[int] = None
     name: Optional[str] = None
 
@@ -47,6 +47,8 @@ class MatchSession:
     team1_voice_channel_id: Optional[int] = None
     team2_voice_channel_id: Optional[int] = None
 
+    match_text_channel_created_by_bot: bool = False  # if True, delete this channel on cleanup
+
     vote_message_id: Optional[int] = None
     draft_message_id: Optional[int] = None
     result_message_id: Optional[int] = None
@@ -59,7 +61,7 @@ class MatchSession:
 class QueueState:
     guild_id: int
     queue_text_channel_id: int
-    match_text_channel_id: int
+    match_text_channel_id: Optional[int]  # None = create temp channel per match
     category_id: Optional[int]
     name: Optional[str]
     current_message_id: Optional[int] = None
@@ -94,12 +96,11 @@ def load_queue_configs() -> dict[int, QueueConfig]:
     for idx, item in enumerate(data):
         if not isinstance(item, dict):
             raise RuntimeError(f"QUEUES_JSON[{idx}] must be an object.")
-        if "queue_text_channel_id" not in item or "match_text_channel_id" not in item:
-            raise RuntimeError(
-                f"QUEUES_JSON[{idx}] must include queue_text_channel_id and match_text_channel_id."
-            )
+        if "queue_text_channel_id" not in item:
+            raise RuntimeError(f"QUEUES_JSON[{idx}] must include queue_text_channel_id.")
         qid = int(item["queue_text_channel_id"])
-        mid = int(item["match_text_channel_id"])
+        raw_mid = item.get("match_text_channel_id")
+        mid = int(raw_mid) if raw_mid is not None else None
         cid = int(item["category_id"]) if "category_id" in item and item["category_id"] is not None else None
         name = str(item["name"]) if "name" in item and item["name"] is not None else None
 
@@ -560,25 +561,66 @@ class QueueView(View):
 async def start_match_from_queue(state: QueueState, player_ids: list[int]) -> None:
     guild = bot.get_guild(state.guild_id)
     if guild is None:
-        # Release players back into queue eligibility.
         async with get_queue_lock((state.guild_id, state.queue_text_channel_id)):
             state.active_match_participants.difference_update(player_ids)
         return
 
-    match_text_channel = guild.get_channel(state.match_text_channel_id)
-    if not isinstance(match_text_channel, discord.TextChannel):
-        async with get_queue_lock((state.guild_id, state.queue_text_channel_id)):
-            state.active_match_participants.difference_update(player_ids)
-        return
+    match_text_channel: discord.TextChannel
+    match_channel_created_by_bot = False
+
+    if state.match_text_channel_id is not None:
+        ch = guild.get_channel(state.match_text_channel_id)
+        if not isinstance(ch, discord.TextChannel):
+            async with get_queue_lock((state.guild_id, state.queue_text_channel_id)):
+                state.active_match_participants.difference_update(player_ids)
+            return
+        match_text_channel = ch
+    else:
+        category: Optional[discord.CategoryChannel] = None
+        if state.category_id is not None:
+            cat = guild.get_channel(state.category_id)
+            if isinstance(cat, discord.CategoryChannel):
+                category = cat
+        if category is None:
+            queue_ch = guild.get_channel(state.queue_text_channel_id)
+            if isinstance(queue_ch, discord.TextChannel) and queue_ch.category is not None:
+                category = queue_ch.category
+        overwrites: dict[Any, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        }
+        for pid in player_ids:
+            m = guild.get_member(pid)
+            if m is None:
+                try:
+                    m = await guild.fetch_member(pid)
+                except (discord.NotFound, discord.HTTPException):
+                    continue
+            if m is not None:
+                overwrites[m] = discord.PermissionOverwrite(
+                    view_channel=True, read_message_history=True, send_messages=True
+                )
+        session_id_short = uuid.uuid4().hex[:6]
+        try:
+            match_text_channel = await guild.create_text_channel(
+                name=f"8s-match-{session_id_short}",
+                category=category,
+                overwrites=overwrites,
+            )
+        except discord.Forbidden:
+            async with get_queue_lock((state.guild_id, state.queue_text_channel_id)):
+                state.active_match_participants.difference_update(player_ids)
+            return
+        match_channel_created_by_bot = True
 
     session_id = uuid.uuid4().hex[:6]
     session = MatchSession(
         guild_id=guild.id,
         queue_text_channel_id=state.queue_text_channel_id,
-        match_text_channel_id=state.match_text_channel_id,
+        match_text_channel_id=match_text_channel.id,
         category_id=state.category_id,
         session_id=session_id,
         player_ids=player_ids,
+        match_text_channel_created_by_bot=match_channel_created_by_bot,
     )
     ACTIVE_SESSIONS[session_id] = session
     get_session_lock(session_id)
@@ -605,6 +647,9 @@ async def cancel_session(session_id: str, reason: str) -> None:
         return
 
     guild = bot.get_guild(session.guild_id)
+    match_ch_id = session.match_text_channel_id
+    created_by_bot = session.match_text_channel_created_by_bot
+
     if guild is not None:
         match_text = guild.get_channel(session.match_text_channel_id)
         if isinstance(match_text, discord.TextChannel):
@@ -619,6 +664,14 @@ async def cancel_session(session_id: str, reason: str) -> None:
     await cleanup_voice_channels(session)
     ACTIVE_SESSIONS.pop(session_id, None)
     SESSION_LOCKS.pop(session_id, None)
+
+    if created_by_bot and guild is not None and match_ch_id is not None:
+        ch = guild.get_channel(match_ch_id)
+        if isinstance(ch, discord.TextChannel):
+            try:
+                await ch.delete()
+            except discord.Forbidden:
+                pass
 
 
 async def captain_vote_timeout_task(session_id: str) -> None:
@@ -973,6 +1026,14 @@ async def end_match_and_cleanup(session_id: str) -> None:
                     continue
 
     await cleanup_voice_channels(session)
+
+    if session.match_text_channel_created_by_bot and session.match_text_channel_id is not None:
+        match_ch = guild.get_channel(session.match_text_channel_id)
+        if isinstance(match_ch, discord.TextChannel):
+            try:
+                await match_ch.delete()
+            except discord.Forbidden:
+                pass
 
     queue_key = (session.guild_id, session.queue_text_channel_id)
     state = QUEUE_STATES.get(queue_key)
