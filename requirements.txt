@@ -1,2 +1,5 @@
 discord.py
 flask
+base58
+qrcode
+python-dotenv
