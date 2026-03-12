@@ -1,0 +1,11 @@
+[
+  {"queue_text_channel_id": 1477885338470060115, "match_text_channel_id": null, "name": "COD4 Queue", "category_id": 1481434598658412545, "waiting_room_voice_channel_id": 1480024298436559010},
+  {"queue_text_channel_id": 1477885451221078017, "match_text_channel_id": null, "name": "WaW Queue", "category_id": 1481434598658412545, "waiting_room_voice_channel_id": 1477855928802869280},
+  {"queue_text_channel_id": 1477885562538037270, "match_text_channel_id": null, "name": "MW2 Queue", "category_id": 1481434598658412545, "waiting_room_voice_channel_id": 1477855996704456745},
+  {"queue_text_channel_id": 1477885488084815943, "match_text_channel_id": null, "name": "BO1 Queue", "category_id": 1481434598658412545, "waiting_room_voice_channel_id": 1480024187484766218},
+  {"queue_text_channel_id": 1477885507861221508, "match_text_channel_id": null, "name": "MW3 Queue", "category_id": 1481434598658412545, "waiting_room_voice_channel_id": 1477856124362555472},
+  {"queue_text_channel_id": 1480025016954261726, "match_text_channel_id": null, "name": "BO2 Queue", "category_id": 1481434598658412545, "waiting_room_voice_channel_id": 1480024547909439488},
+  {"queue_text_channel_id": 1477885250246938645, "match_text_channel_id": null, "name": "Ghosts Queue", "category_id": 1481434598658412545, "waiting_room_voice_channel_id": 1480024797961392332},
+  {"queue_text_channel_id": 1480025059564454189, "match_text_channel_id": null, "name": "BO3 Queue", "category_id": 1481434598658412545, "waiting_room_voice_channel_id": 1480023997768007831},
+  {"queue_text_channel_id": 1477879080778072216, "match_text_channel_id": null, "name": "Random Queue", "category_id": 1481434598658412545}
+]

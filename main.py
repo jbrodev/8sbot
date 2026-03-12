@@ -38,6 +38,7 @@ class QueueConfig:
     match_text_channel_id: Optional[int] = None  # None = bot creates temp channel per match and deletes after
     category_id: Optional[int] = None
     name: Optional[str] = None
+    waiting_room_voice_channel_id: Optional[int] = None  # move players here when match ends; None = disconnect
 
 
 @dataclass
@@ -135,6 +136,8 @@ def load_queue_configs() -> dict[int, QueueConfig]:
         mid = int(raw_mid) if raw_mid is not None else None
         cid = int(item["category_id"]) if "category_id" in item and item["category_id"] is not None else None
         name = str(item["name"]) if "name" in item and item["name"] is not None else None
+        raw_wvc = item.get("waiting_room_voice_channel_id")
+        wvc = int(raw_wvc) if raw_wvc is not None else None
 
         if qid in configs:
             raise RuntimeError(f"Duplicate queue_text_channel_id in QUEUES_JSON: {qid}")
@@ -143,6 +146,7 @@ def load_queue_configs() -> dict[int, QueueConfig]:
             match_text_channel_id=mid,
             category_id=cid,
             name=name,
+            waiting_room_voice_channel_id=wvc,
         )
 
     return configs
@@ -1404,7 +1408,14 @@ async def end_match_and_cleanup(session_id: str) -> None:
         ACTIVE_SESSIONS.pop(session_id, None)
         return
 
-    # Disconnect any remaining users in temp channels, then delete channels.
+    # Move players to this queue's waiting room VC (or disconnect if not configured).
+    cfg = QUEUE_CONFIGS.get(session.queue_text_channel_id)
+    waiting_room: Optional[discord.VoiceChannel] = None
+    if cfg is not None and cfg.waiting_room_voice_channel_id is not None:
+        wch = guild.get_channel(cfg.waiting_room_voice_channel_id)
+        if isinstance(wch, discord.VoiceChannel):
+            waiting_room = wch
+
     for cid in [session.team1_voice_channel_id, session.team2_voice_channel_id]:
         if cid is None:
             continue
@@ -1412,7 +1423,7 @@ async def end_match_and_cleanup(session_id: str) -> None:
         if isinstance(ch, discord.VoiceChannel):
             for m in list(ch.members):
                 try:
-                    await m.move_to(None)
+                    await m.move_to(waiting_room)
                 except discord.Forbidden:
                     continue
 
