@@ -1048,16 +1048,8 @@ async def finalize_captain_vote(session_id: str, reason: str) -> None:
         session.team2_ids = [cap2]
         session.remaining_ids = set(session.player_ids) - {cap1, cap2}
 
-        cap1_votes = counts.get(cap1, 0)
-        cap2_votes = counts.get(cap2, 0)
-        if cap1_votes > cap2_votes:
-            first_team = 1
-        elif cap2_votes > cap1_votes:
-            first_team = 2
-        else:
-            first_team = random.choice([1, 2])
-
-        session.pick_order = build_pick_order(first_team)
+        # Team 1 always picks first; pick order: 1, 2, 2, 1, 1, 2
+        session.pick_order = build_pick_order(1)
         session.pick_index = 0
         session.last_pick_ts = time.time()
         session.phase = "draft"
