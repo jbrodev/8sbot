@@ -171,6 +171,41 @@ RESULT_VOTE_MAJORITY = (MATCH_SIZE // 2) + 1  # 5 for 8 players; session closes 
 CANCEL_VOTE_SECONDS = _env_int("CANCEL_VOTE_SECONDS", 60)
 LOBBY_VOICE_SECONDS = _env_int("LOBBY_VOICE_SECONDS", 300)  # time to get all 8 into lobby VC before cancel
 
+# Member fetch throttle + cache to reduce Discord 429 rate limits (GET guild member)
+_MEMBER_CACHE_TTL_SECONDS = 7200  # 2 hours; matches take ~1h, players re-queue after
+_MEMBER_FETCH_INTERVAL = 0.2  # min seconds between fetch_member calls
+_last_member_fetch_time: float = 0.0
+_member_cache: dict[tuple[int, int], tuple[discord.Member, float]] = {}  # (guild_id, user_id) -> (member, cached_at)
+_member_fetch_lock = asyncio.Lock()
+
+
+async def get_or_fetch_member(guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
+    """Return member from cache (if valid TTL) or guild cache, else throttle + fetch and cache. Reduces 429s."""
+    global _last_member_fetch_time
+    key = (guild.id, user_id)
+    now = time.time()
+    cached = _member_cache.get(key)
+    if cached is not None:
+        member, cached_at = cached
+        if now - cached_at <= _MEMBER_CACHE_TTL_SECONDS:
+            return member
+        del _member_cache[key]
+    m = guild.get_member(user_id)
+    if m is not None:
+        _member_cache[key] = (m, now)
+        return m
+    async with _member_fetch_lock:
+        elapsed = time.time() - _last_member_fetch_time
+        if elapsed < _MEMBER_FETCH_INTERVAL:
+            await asyncio.sleep(_MEMBER_FETCH_INTERVAL - elapsed)
+        try:
+            m = await guild.fetch_member(user_id)
+        except (discord.NotFound, discord.HTTPException):
+            return None
+        _last_member_fetch_time = time.time()
+        _member_cache[key] = (m, _last_member_fetch_time)
+        return m
+
 # Game-based temp channel naming: cod4match-1001, cod4lobby-1001, etc. (slots 1001-1010 per game)
 MATCH_SLOT_MIN = 1001
 MATCH_SLOT_MAX = 1010  # max 10 concurrent matches per game
@@ -345,15 +380,10 @@ def format_captain_vote_message_content(guild: discord.Guild, session: MatchSess
 
 
 async def resolve_display_names(guild: discord.Guild, ids: list[int]) -> dict[int, str]:
-    """Resolve display names for button labels; fetch member if not in cache. Never returns raw IDs."""
+    """Resolve display names for button labels; uses throttled+cached get_or_fetch_member. Never returns raw IDs."""
     result: dict[int, str] = {}
     for pid in ids:
-        m = guild.get_member(pid)
-        if m is None:
-            try:
-                m = await guild.fetch_member(pid)
-            except (discord.NotFound, discord.HTTPException):
-                pass
+        m = await get_or_fetch_member(guild, pid)
         if m is not None:
             name = m.display_name or m.name or "Player"
         else:
@@ -845,12 +875,7 @@ async def start_match_from_queue(state: QueueState, player_ids: list[int]) -> No
                 view_channel=True, read_message_history=True, send_messages=True
             )
         for pid in player_ids:
-            m = guild.get_member(pid)
-            if m is None:
-                try:
-                    m = await guild.fetch_member(pid)
-                except (discord.NotFound, discord.HTTPException):
-                    continue
+            m = await get_or_fetch_member(guild, pid)
             if m is not None:
                 overwrites[m] = discord.PermissionOverwrite(
                     view_channel=True, read_message_history=True, send_messages=True
@@ -882,12 +907,7 @@ async def start_match_from_queue(state: QueueState, player_ids: list[int]) -> No
     if guild.me is not None:
         lobby_overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
     for pid in player_ids:
-        m = guild.get_member(pid)
-        if m is None:
-            try:
-                m = await guild.fetch_member(pid)
-            except (discord.NotFound, discord.HTTPException):
-                continue
+        m = await get_or_fetch_member(guild, pid)
         if m is not None:
             lobby_overwrites[m] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
     # Use game-based lobby name when we created the match channel (slot is set)
@@ -1232,12 +1252,7 @@ async def create_team_channels_and_move(session_id: str) -> None:
         if guild.me is not None:
             overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
         for pid in team_ids:
-            m = guild.get_member(pid)
-            if m is None:
-                try:
-                    m = await guild.fetch_member(pid)
-                except (discord.NotFound, discord.HTTPException):
-                    continue
+            m = await get_or_fetch_member(guild, pid)
             if m is not None:
                 overwrites[m] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
         return overwrites
@@ -1434,6 +1449,16 @@ async def end_match_and_cleanup(session_id: str) -> None:
     if state is not None:
         async with get_queue_lock(queue_key):
             state.active_match_participants.difference_update(session.player_ids)
+
+    # Refresh the existing queue message in this game's channel only (no new message, no other channels).
+    if state is not None and state.current_message_id is not None and guild is not None:
+        queue_ch = guild.get_channel(session.queue_text_channel_id)
+        if isinstance(queue_ch, discord.TextChannel):
+            try:
+                msg = await queue_ch.fetch_message(state.current_message_id)
+                await msg.edit(content=format_queue_message(state), view=QueueView(queue_key))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
 
     ACTIVE_SESSIONS.pop(session_id, None)
     SESSION_LOCKS.pop(session_id, None)
@@ -1642,6 +1667,7 @@ async def on_ready():
         return
     bot._queue_messages_posted = True  # type: ignore[attr-defined]
 
+    expected_custom_id_prefix = "queue:join:"
     for cfg in QUEUE_CONFIGS.values():
         ch = bot.get_channel(cfg.queue_text_channel_id)
         if not isinstance(ch, discord.TextChannel):
@@ -1657,8 +1683,39 @@ async def on_ready():
             name=cfg.name,
         )
         QUEUE_STATES[key] = state
-        msg = await ch.send(content=format_queue_message(state), view=QueueView(key))
-        state.current_message_id = msg.id
+
+        # Look for an existing queue message from us (avoid reposting on restart); restore queued users from content.
+        existing_message_id: Optional[int] = None
+        try:
+            async for msg in ch.history(limit=30):
+                if msg.author != bot.user:
+                    continue
+                for row in msg.components:
+                    for child in getattr(row, "children", []):
+                        cid = getattr(child, "custom_id", None)
+                        if cid and cid.startswith(expected_custom_id_prefix):
+                            parts = cid.split(":")
+                            if len(parts) >= 4 and int(parts[2]) == ch.guild.id and int(parts[3]) == ch.id:
+                                existing_message_id = msg.id
+                                break
+                    if existing_message_id is not None:
+                        break
+                if existing_message_id is not None:
+                    break
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        if existing_message_id is not None:
+            state.current_message_id = existing_message_id
+            try:
+                existing_msg = await ch.fetch_message(existing_message_id)
+                # Restore queued user IDs from <@id> mentions in the message
+                state.queued_user_ids = [int(uid) for uid in re.findall(r"<@!?(\d+)>", existing_msg.content)]
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        else:
+            msg = await ch.send(content=format_queue_message(state), view=QueueView(key))
+            state.current_message_id = msg.id
 
 
 def main():
