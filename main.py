@@ -1707,6 +1707,7 @@ async def on_ready():
 
         if existing_message_id is not None:
             state.current_message_id = existing_message_id
+            bot.add_view(QueueView(key), message_id=existing_message_id)
             try:
                 existing_msg = await ch.fetch_message(existing_message_id)
                 # Restore queued user IDs from <@id> mentions in the message
