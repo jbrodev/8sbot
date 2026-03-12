@@ -3,6 +3,7 @@ import io
 import json
 import os
 import random
+import re
 import secrets
 import time
 import uuid
@@ -68,6 +69,7 @@ class MatchSession:
     team2_voice_channel_id: Optional[int] = None
 
     match_text_channel_created_by_bot: bool = False  # if True, delete this channel on cleanup
+    match_slot_number: Optional[int] = None  # e.g. 1001 for cod4match-1001; used for game-based channel names
 
     vote_message_id: Optional[int] = None
     draft_message_id: Optional[int] = None
@@ -161,8 +163,46 @@ SESSION_LOCKS: dict[str, asyncio.Lock] = {}
 VOTE_SECONDS = _env_int("VOTE_SECONDS", 60)
 DRAFT_SECONDS = _env_int("DRAFT_SECONDS", 180)
 RESULT_VOTE_SECONDS = _env_int("RESULT_VOTE_SECONDS", 60)
+RESULT_VOTE_MAJORITY = (MATCH_SIZE // 2) + 1  # 5 for 8 players; session closes only with this many votes for one team
 CANCEL_VOTE_SECONDS = _env_int("CANCEL_VOTE_SECONDS", 60)
 LOBBY_VOICE_SECONDS = _env_int("LOBBY_VOICE_SECONDS", 300)  # time to get all 8 into lobby VC before cancel
+
+# Game-based temp channel naming: cod4match-1001, cod4lobby-1001, etc. (slots 1001-1010 per game)
+MATCH_SLOT_MIN = 1001
+MATCH_SLOT_MAX = 1010  # max 10 concurrent matches per game
+
+
+def _queue_name_to_slug(name: Optional[str]) -> str:
+    """Convert queue display name to channel name slug, e.g. 'COD4 Queue' -> 'cod4'."""
+    if not name or not name.strip():
+        return "8s"
+    s = name.strip().lower().replace(" queue", "").replace(" ", "")
+    return s if s else "8s"
+
+
+def _next_match_slot(
+    guild: discord.Guild,
+    category: Optional[discord.CategoryChannel],
+    slug: str,
+) -> int:
+    """Return first available slot in [MATCH_SLOT_MIN, MATCH_SLOT_MAX] for channels named {slug}match-NNNN in category."""
+    used: set[int] = set()
+    pattern = re.compile(re.escape(slug) + r"match-(\d{4})\Z")
+    if category is not None:
+        for ch in category.channels:
+            if ch.name:
+                m = pattern.match(ch.name)
+                if m:
+                    try:
+                        n = int(m.group(1))
+                        if MATCH_SLOT_MIN <= n <= MATCH_SLOT_MAX:
+                            used.add(n)
+                    except ValueError:
+                        pass
+    for slot in range(MATCH_SLOT_MIN, MATCH_SLOT_MAX + 1):
+        if slot not in used:
+            return slot
+    return MATCH_SLOT_MIN  # fallback if all slots used
 
 
 def get_session_by_match_channel(channel_id: int) -> Optional[MatchSession]:
@@ -490,7 +530,7 @@ class StartResultVoteButton(Button):
             session.result_votes.clear()
 
         await interaction.response.send_message(
-            "Vote which team won:",
+            f"Vote which team won (need {RESULT_VOTE_MAJORITY}/{MATCH_SIZE} majority; vote ends in {RESULT_VOTE_SECONDS}s if no majority):",
             view=ResultVoteView(session.session_id),
         )
         bot.loop.create_task(result_vote_timeout_task(self.session_id))
@@ -530,11 +570,12 @@ class ResultVoteButton(Button):
             session.result_votes[voter_id] = self.team
             count1 = sum(1 for t in session.result_votes.values() if t == 1)
             count2 = sum(1 for t in session.result_votes.values() if t == 2)
-            total = count1 + count2
-            done = total >= 1 and count1 != count2  # majority: one team ahead
+            done = (count1 >= RESULT_VOTE_MAJORITY and count1 > count2) or (
+                count2 >= RESULT_VOTE_MAJORITY and count2 > count1
+            )
 
         await interaction.response.send_message(
-            f"Vote recorded. Current tally: Team 1 = {count1}, Team 2 = {count2}. (Majority wins.)",
+            f"Vote recorded. Current tally: Team 1 = {count1}, Team 2 = {count2}. (Need {RESULT_VOTE_MAJORITY}/{MATCH_SIZE} for one team to win.)",
             ephemeral=True,
         )
 
@@ -772,6 +813,8 @@ async def start_match_from_queue(state: QueueState, player_ids: list[int]) -> No
 
     match_text_channel: discord.TextChannel
     match_channel_created_by_bot = False
+    slot: Optional[int] = None
+    slug = "8s"
 
     if state.match_text_channel_id is not None:
         ch = guild.get_channel(state.match_text_channel_id)
@@ -808,10 +851,11 @@ async def start_match_from_queue(state: QueueState, player_ids: list[int]) -> No
                 overwrites[m] = discord.PermissionOverwrite(
                     view_channel=True, read_message_history=True, send_messages=True
                 )
-        session_id_short = uuid.uuid4().hex[:6]
+        slug = _queue_name_to_slug(state.name)
+        slot = _next_match_slot(guild, category, slug)
         try:
             match_text_channel = await guild.create_text_channel(
-                name=f"8s-match-{session_id_short}",
+                name=f"{slug}match-{slot}",
                 category=category,
                 overwrites=overwrites,
             )
@@ -842,9 +886,12 @@ async def start_match_from_queue(state: QueueState, player_ids: list[int]) -> No
                 continue
         if m is not None:
             lobby_overwrites[m] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
+    # Use game-based lobby name when we created the match channel (slot is set)
+    lobby_slot = slot if match_channel_created_by_bot else None
+    lobby_name = f"{slug}lobby-{lobby_slot}" if lobby_slot is not None else f"8s-lobby-{session_id[:6]}"
     try:
         lobby_vc = await guild.create_voice_channel(
-            name=f"8s-lobby-{session_id[:6]}",
+            name=lobby_name,
             category=category_for_lobby,
             overwrites=lobby_overwrites,
         )
@@ -869,6 +916,7 @@ async def start_match_from_queue(state: QueueState, player_ids: list[int]) -> No
         lobby_voice_channel_id=lobby_vc.id,
         lobby_created_by_bot=True,
         match_text_channel_created_by_bot=match_channel_created_by_bot,
+        match_slot_number=slot,
     )
     ACTIVE_SESSIONS[session_id] = session
     get_session_lock(session_id)
@@ -1087,6 +1135,17 @@ async def apply_pick_and_advance(session_id: str, picked_id: int, autopick: bool
         session.pick_index += 1
         session.last_pick_ts = time.time()
 
+        # Auto-place last remaining player onto the team that's due to pick (no manual pick needed)
+        if len(session.remaining_ids) == 1 and session.pick_index < len(session.pick_order):
+            last_id = next(iter(session.remaining_ids))
+            team_to_pick = session.pick_order[session.pick_index]
+            if team_to_pick == 1:
+                session.team1_ids.append(last_id)
+            else:
+                session.team2_ids.append(last_id)
+            session.remaining_ids.clear()
+            session.pick_index += 1
+
         done = session.pick_index >= len(session.pick_order) or not session.remaining_ids
         if done:
             session.phase = "in_match"
@@ -1187,9 +1246,16 @@ async def create_team_channels_and_move(session_id: str) -> None:
                 overwrites[m] = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
         return overwrites
 
-    base_name = f"8s-{session.session_id}"
-    team1_name = f"{base_name}-team1"
-    team2_name = f"{base_name}-team2"
+    queue_state = QUEUE_STATES.get((session.guild_id, session.queue_text_channel_id))
+    slug = _queue_name_to_slug(queue_state.name if queue_state else None)
+    slot = session.match_slot_number
+    if slot is not None:
+        team1_name = f"{slug}team1-{slot}"
+        team2_name = f"{slug}team2-{slot}"
+    else:
+        base_name = f"8s-{session.session_id}"
+        team1_name = f"{base_name}-team1"
+        team2_name = f"{base_name}-team2"
 
     try:
         team1_overwrites = await overwrites_for_team(session.team1_ids)
@@ -1277,12 +1343,27 @@ async def finalize_result_vote(session_id: str, reason: str) -> None:
 
         count1 = sum(1 for t in session.result_votes.values() if t == 1)
         count2 = sum(1 for t in session.result_votes.values() if t == 2)
-        if count1 > count2:
+        if count1 >= RESULT_VOTE_MAJORITY and count1 > count2:
             winner = 1
-        elif count2 > count1:
+        elif count2 >= RESULT_VOTE_MAJORITY and count2 > count1:
             winner = 2
         else:
             winner = 0
+
+        # Timeout with no 5/8 majority: do not close session; reset so they can start vote again
+        if reason == "timeout" and winner == 0:
+            session.phase = "in_match"
+            session.result_votes.clear()
+            session.result_started_ts = None
+
+    # If timeout and no majority, send message and return without closing session
+    if reason == "timeout" and winner == 0:
+        match_text = guild.get_channel(session.match_text_channel_id)
+        if isinstance(match_text, discord.TextChannel):
+            await match_text.send(
+                "Not enough players voted. Match remains open. You can start the winner vote again when ready."
+            )
+        return
 
     match_text = guild.get_channel(session.match_text_channel_id)
     if isinstance(match_text, discord.TextChannel):
