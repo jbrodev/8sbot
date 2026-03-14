@@ -3,3 +3,4 @@ flask
 base58
 qrcode
 python-dotenv
+aiohttp

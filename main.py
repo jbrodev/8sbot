@@ -11,6 +11,7 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+import aiohttp
 import base58
 import qrcode
 
@@ -266,6 +267,194 @@ def get_session_by_match_channel(channel_id: int) -> Optional[MatchSession]:
             return session
     return None
 
+
+# MMR leaderboard: per-guild, per-user, per-game (slug). Default 1000; store wins/losses for website.
+# Structure: MMR_DATA[guild_id][user_id][game_slug] = {"mmr": int, "wins": int, "losses": int}
+MMR_DATA: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
+MMR_LOCK = asyncio.Lock()
+_env_dir_mmr = os.path.dirname(os.path.abspath(__file__))
+MMR_FILE = os.path.join(_env_dir_mmr, "mmr.json")
+
+DEFAULT_MMR = 1000
+MMR_MIN = 100
+MMR_MAX = 5000
+ELO_K = 32
+
+
+def get_game_slug_from_session(session: MatchSession) -> str:
+    """Resolve queue name to game slug for MMR lookup (e.g. cod4, mw2)."""
+    queue_key = (session.guild_id, session.queue_text_channel_id)
+    state = QUEUE_STATES.get(queue_key)
+    if state is None or not state.name:
+        return "unknown"
+    return _queue_name_to_slug(state.name)
+
+
+def get_mmr(guild_id: int, user_id: int, game_slug: str) -> tuple[int, int, int]:
+    """Return (mmr, wins, losses) for the player in this guild/game; default (1000, 0, 0)."""
+    g = MMR_DATA.get(str(guild_id))
+    if not g:
+        return (DEFAULT_MMR, 0, 0)
+    p = g.get(str(user_id))
+    if not p:
+        return (DEFAULT_MMR, 0, 0)
+    game = p.get(str(game_slug))
+    if not game or not isinstance(game, dict):
+        return (DEFAULT_MMR, 0, 0)
+    mmr = int(game.get("mmr", DEFAULT_MMR))
+    wins = int(game.get("wins", 0))
+    losses = int(game.get("losses", 0))
+    return (mmr, wins, losses)
+
+
+def _ensure_mmr_entry(guild_id: int, user_id: int, game_slug: str) -> dict[str, Any]:
+    g = MMR_DATA.setdefault(str(guild_id), {})
+    p = g.setdefault(str(user_id), {})
+    if str(game_slug) not in p or not isinstance(p[str(game_slug)], dict):
+        p[str(game_slug)] = {"mmr": DEFAULT_MMR, "wins": 0, "losses": 0}
+    return p[str(game_slug)]
+
+
+async def load_mmr_from_file() -> None:
+    """Load MMR data from JSON file at startup."""
+    async with MMR_LOCK:
+        if not os.path.isfile(MMR_FILE):
+            return
+        try:
+            with open(MMR_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and "guilds" in data:
+                MMR_DATA.clear()
+                for gid, gdata in data["guilds"].items():
+                    if not isinstance(gdata, dict) or "players" not in gdata:
+                        continue
+                    MMR_DATA[str(gid)] = {}
+                    for uid, pdata in gdata["players"].items():
+                        if not isinstance(pdata, dict) or "games" not in pdata:
+                            continue
+                        MMR_DATA[str(gid)][str(uid)] = {}
+                        for slug, sdata in pdata["games"].items():
+                            if isinstance(sdata, dict):
+                                MMR_DATA[str(gid)][str(uid)][str(slug)] = {
+                                    "mmr": int(sdata.get("mmr", DEFAULT_MMR)),
+                                    "wins": int(sdata.get("wins", 0)),
+                                    "losses": int(sdata.get("losses", 0)),
+                                }
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"MMR load failed: {e}")
+
+
+async def save_mmr_to_file() -> None:
+    """Persist MMR data to JSON file. Caller should hold MMR_LOCK or call from update_mmr_after_match."""
+    data: dict[str, Any] = {"guilds": {}}
+    for gid, g in MMR_DATA.items():
+        data["guilds"][gid] = {"players": {}}
+        for uid, p in g.items():
+            data["guilds"][gid]["players"][uid] = {"games": dict(p)}
+    try:
+        with open(MMR_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError as e:
+        print(f"MMR save failed: {e}")
+
+
+async def update_mmr_after_match(
+    guild_id: int,
+    game_slug: str,
+    team1_ids: list[int],
+    team2_ids: list[int],
+    winner: int,
+) -> None:
+    """Update MMR and wins/losses after a match. winner in (1, 2). Uses Elo-style team update."""
+    if winner not in (1, 2):
+        return
+    async with MMR_LOCK:
+        avg1 = sum(get_mmr(guild_id, uid, game_slug)[0] for uid in team1_ids) / max(len(team1_ids), 1)
+        avg2 = sum(get_mmr(guild_id, uid, game_slug)[0] for uid in team2_ids) / max(len(team2_ids), 1)
+        expected1 = 1.0 / (1.0 + 10.0 ** ((avg2 - avg1) / 400.0))
+        actual1 = 1.0 if winner == 1 else 0.0
+        delta = ELO_K * (actual1 - expected1)
+
+        for uid in team1_ids:
+            entry = _ensure_mmr_entry(guild_id, uid, game_slug)
+            entry["mmr"] = max(MMR_MIN, min(MMR_MAX, round(entry["mmr"] + delta)))
+            if winner == 1:
+                entry["wins"] = entry.get("wins", 0) + 1
+            else:
+                entry["losses"] = entry.get("losses", 0) + 1
+        for uid in team2_ids:
+            entry = _ensure_mmr_entry(guild_id, uid, game_slug)
+            entry["mmr"] = max(MMR_MIN, min(MMR_MAX, round(entry["mmr"] - delta)))
+            if winner == 2:
+                entry["wins"] = entry.get("wins", 0) + 1
+            else:
+                entry["losses"] = entry.get("losses", 0) + 1
+        await save_mmr_to_file()
+
+
+def render_players_with_mmr(
+    guild: discord.Guild,
+    ids: list[int],
+    guild_id: int,
+    game_slug: str,
+) -> str:
+    """Like render_players but appends (MMR) for each player."""
+    parts: list[str] = []
+    for pid in ids:
+        m = guild.get_member(pid)
+        mention = m.mention if m is not None else f"<@{pid}>"
+        mmr, _, _ = get_mmr(guild_id, pid, game_slug)
+        parts.append(f"{mention} ({mmr})")
+    return ", ".join(parts) if parts else "(none)"
+
+
+# Leaderboard ingest: push MMR data to Supabase edge function after each match
+LEADERBOARD_INGEST_URL = os.getenv("LEADERBOARD_INGEST_URL", "").strip()
+BOT_INGEST_SECRET = os.getenv("BOT_INGEST_SECRET", "").strip()
+
+
+async def push_leaderboard_ingest(
+    guild_id: int,
+    game_slug: str,
+    player_ids: list[int],
+) -> None:
+    """Send each player's current MMR/wins/losses for this game to the leaderboard ingest endpoint."""
+    if not LEADERBOARD_INGEST_URL or not BOT_INGEST_SECRET:
+        return
+    guild = bot.get_guild(guild_id)
+    if guild is None:
+        return
+    headers = {"Content-Type": "application/json", "x-bot-secret": BOT_INGEST_SECRET}
+
+    async def send_one(uid: int) -> None:
+        mmr, wins, losses = get_mmr(guild_id, uid, game_slug)
+        member = await get_or_fetch_member(guild, uid)
+        username = (member.display_name or member.name or "Player") if member else "Player"
+        payload = {
+            "discord_user_id": str(uid),
+            "username": username,
+            "game_slug": game_slug,
+            "mmr": mmr,
+            "wins": wins,
+            "losses": losses,
+            "trophies": 0,
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    LEADERBOARD_INGEST_URL,
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status >= 400:
+                        print(f"Leaderboard ingest failed for {uid}: {resp.status}")
+        except Exception as e:
+            print(f"Leaderboard ingest error for {uid}: {e}")
+
+    await asyncio.gather(*[send_one(uid) for uid in player_ids])
+
+
 # Wager (Solana Pay QR)
 WAGER_SOLANA_WALLET = os.getenv("WAGER_SOLANA_WALLET", "").strip()
 WAGER_SPL_MINT = os.getenv("WAGER_SPL_MINT", "").strip() or None  # e.g. USDC mint; empty = SOL
@@ -385,13 +574,18 @@ def _captain_vote_counts(votes: dict[int, list[int]], player_ids: list[int]) -> 
 
 
 def format_captain_vote_message_content(guild: discord.Guild, session: MatchSession) -> str:
-    """Build the captain vote message text with vote count shown under each player."""
+    """Build the captain vote message text with vote count and MMR shown per player."""
     intro = (
         f"✅ **All {MATCH_SIZE} players are in the lobby.**\n\n"
         f"Each player vote for **2 captains** (2 clicks total). Voting ends in **{VOTE_SECONDS}s**.\n\n"
     )
     counts = _captain_vote_counts(session.captain_votes, session.player_ids)
-    lines = [f"<@{pid}> — **{counts.get(pid, 0)}** vote{'s' if counts.get(pid, 0) != 1 else ''}" for pid in session.player_ids]
+    slug = get_game_slug_from_session(session)
+    lines = []
+    for pid in session.player_ids:
+        vote_count = counts.get(pid, 0)
+        mmr, _, _ = get_mmr(session.guild_id, pid, slug)
+        lines.append(f"<@{pid}> — **{vote_count}** vote{'s' if vote_count != 1 else ''} · MMR {mmr}")
     return intro + "**Vote tally (captain votes per player):**\n" + "\n".join(lines)
 
 
@@ -1146,10 +1340,11 @@ async def finalize_captain_vote(session_id: str, reason: str) -> None:
     captain_member = guild.get_member(captain_id) if captain_id else None
     picker = captain_member.mention if captain_member else f"<@{captain_id}>"
 
+    slug = get_game_slug_from_session(session)
     msg = await match_text.send(
         f"🧢 **Captains chosen** (reason: `{reason}`): <@{session.captain_ids[0]}> vs <@{session.captain_ids[1]}>\n\n"
         f"**Draft started**. {picker} is picking now.\n"
-        f"Available: {render_players(guild, remaining_sorted)}\n\n"
+        f"Available: {render_players_with_mmr(guild, remaining_sorted, session.guild_id, slug)}\n\n"
         f"Draft auto-picks after **{DRAFT_SECONDS}s** of inactivity.",
         view=draft_view,
     )
@@ -1255,12 +1450,13 @@ async def apply_pick_and_advance(session_id: str, picked_id: int, autopick: bool
         captain_member = guild.get_member(captain_id) if captain_id else None
         picker = captain_member.mention if captain_member else f"<@{captain_id}>"
 
+        slug = get_game_slug_from_session(session)
         content = (
             f"✅ Pick {'(auto)' if autopick else ''}: {picked_label}\n\n"
             f"Now picking: {picker}\n"
-            f"Team 1: {render_players(guild, session.team1_ids)}\n"
-            f"Team 2: {render_players(guild, session.team2_ids)}\n\n"
-            f"Available: {render_players(guild, remaining_sorted)}"
+            f"Team 1: {render_players_with_mmr(guild, session.team1_ids, session.guild_id, slug)}\n"
+            f"Team 2: {render_players_with_mmr(guild, session.team2_ids, session.guild_id, slug)}\n\n"
+            f"Available: {render_players_with_mmr(guild, remaining_sorted, session.guild_id, slug)}"
         )
         if msg is not None:
             await msg.edit(content=content, view=draft_view)
@@ -1270,6 +1466,7 @@ async def apply_pick_and_advance(session_id: str, picked_id: int, autopick: bool
         return
 
     # Draft finished => create temp voice channels and move players.
+    slug = get_game_slug_from_session(session)
     maps_line = ""
     if session.selected_maps:
         maps_line = "\n**Maps:** " + ", ".join(f"Map {i + 1}: {m}" for i, m in enumerate(session.selected_maps)) + "\n\n"
@@ -1277,8 +1474,8 @@ async def apply_pick_and_advance(session_id: str, picked_id: int, autopick: bool
         maps_line = "\n**Maps:** —\n\n"
     content = (
         f"🏁 Draft complete.\n"
-        f"Team 1: {render_players(guild, session.team1_ids)}\n"
-        f"Team 2: {render_players(guild, session.team2_ids)}\n\n"
+        f"Team 1: {render_players_with_mmr(guild, session.team1_ids, session.guild_id, slug)}\n"
+        f"Team 2: {render_players_with_mmr(guild, session.team2_ids, session.guild_id, slug)}\n\n"
         f"{maps_line}"
         f"Creating team voice channels and moving players now…"
     )
@@ -1459,6 +1656,18 @@ async def finalize_result_vote(session_id: str, reason: str) -> None:
             )
         await match_text.send(msg)
 
+    if winner in (1, 2):
+        slug = get_game_slug_from_session(session)
+        await update_mmr_after_match(
+            session.guild_id,
+            slug,
+            session.team1_ids,
+            session.team2_ids,
+            winner,
+        )
+        # Push updated MMR to leaderboard ingest (Supabase edge function)
+        all_player_ids = list(session.team1_ids) + list(session.team2_ids)
+        bot.loop.create_task(push_leaderboard_ingest(session.guild_id, slug, all_player_ids))
     await end_match_and_cleanup(session_id)
 
 
@@ -1860,6 +2069,8 @@ async def on_ready():
         print(f"Slash commands synced: {len(synced)}")
     except Exception as e:
         print(f"Slash command sync failed: {e}")
+
+    await load_mmr_from_file()
 
     if getattr(bot, "_queue_messages_posted", False):
         return
