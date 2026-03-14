@@ -26,6 +26,7 @@ elif os.path.isfile(_env_path_txt):
     load_dotenv(_env_path_txt)
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 from discord.ui import Button, View
 
@@ -853,7 +854,49 @@ class QueueView(View):
         self.add_item(QueueLeaveButton(queue_key))
 
 
+async def remove_players_from_other_queues(
+    guild_id: int,
+    source_queue_key: tuple[int, int],
+    player_ids: list[int],
+) -> None:
+    """Remove player_ids from every other queue in the same guild (they are now in a match)."""
+    player_set = set(player_ids)
+    # Lock queues in a consistent order to avoid deadlock
+    for queue_key in sorted(QUEUE_STATES.keys()):
+        if queue_key[0] != guild_id or queue_key == source_queue_key:
+            continue
+        state = QUEUE_STATES.get(queue_key)
+        if state is None:
+            continue
+        async with get_queue_lock(queue_key):
+            before_len = len(state.queued_user_ids)
+            state.queued_user_ids = [uid for uid in state.queued_user_ids if uid not in player_set]
+            if before_len == len(state.queued_user_ids):
+                continue  # no one was in this queue
+            content = format_queue_message(state)
+            message_id = state.current_message_id
+        if not message_id:
+            continue
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            continue
+        ch = guild.get_channel(queue_key[1])
+        if isinstance(ch, discord.TextChannel):
+            try:
+                msg = await ch.fetch_message(message_id)
+                await msg.edit(content=content, view=QueueView(queue_key))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+
+
 async def start_match_from_queue(state: QueueState, player_ids: list[int]) -> None:
+    # Remove these players from any other queues they are in (same guild)
+    await remove_players_from_other_queues(
+        state.guild_id,
+        (state.guild_id, state.queue_text_channel_id),
+        player_ids,
+    )
+
     guild = bot.get_guild(state.guild_id)
     if guild is None:
         async with get_queue_lock((state.guild_id, state.queue_text_channel_id)):
@@ -1659,6 +1702,132 @@ async def slash_cancelmatch(interaction: discord.Interaction) -> None:
     async with get_session_lock(session.session_id):
         session.cancel_vote_message_id = msg.id
     bot.loop.create_task(cancel_vote_timeout_task(session.session_id))
+
+
+@bot.tree.command(name="sub", description="Substitute a player in this match (match channel only).")
+@app_commands.describe(
+    new_player="The player to add as a substitute.",
+    out_player="The player to replace (who is leaving the match).",
+)
+async def slash_sub(
+    interaction: discord.Interaction,
+    new_player: discord.Member,
+    out_player: discord.Member,
+) -> None:
+    """Substitute out_player with new_player in the current match."""
+    session = get_session_by_match_channel(interaction.channel.id if interaction.channel else 0)
+    if session is None:
+        await interaction.response.send_message(
+            "This command can only be used in an active match channel.",
+            ephemeral=True,
+        )
+        return
+    if interaction.user.id not in session.player_ids:
+        await interaction.response.send_message(
+            "Only match players can substitute someone.",
+            ephemeral=True,
+        )
+        return
+    if session.phase not in ("lobby", "in_match"):
+        await interaction.response.send_message(
+            "Substitutions are only allowed during the lobby (before everyone has joined) or after the match has started.",
+            ephemeral=True,
+        )
+        return
+    out_id = out_player.id
+    new_id = new_player.id
+    if out_id not in session.player_ids:
+        await interaction.response.send_message(
+            f"{out_player.mention} is not in this match.",
+            ephemeral=True,
+        )
+        return
+    if new_id in session.player_ids:
+        await interaction.response.send_message(
+            f"{new_player.mention} is already in this match.",
+            ephemeral=True,
+        )
+        return
+
+    guild = bot.get_guild(session.guild_id)
+    if guild is None:
+        await interaction.response.send_message("Guild not found.", ephemeral=True)
+        return
+
+    # Session updates: always replace in player_ids; in_match also updates teams and votes
+    async with get_session_lock(session.session_id):
+        for i, pid in enumerate(session.player_ids):
+            if pid == out_id:
+                session.player_ids[i] = new_id
+                break
+        if session.phase == "in_match":
+            if out_id in session.team1_ids:
+                for i, pid in enumerate(session.team1_ids):
+                    if pid == out_id:
+                        session.team1_ids[i] = new_id
+                        break
+            else:
+                for i, pid in enumerate(session.team2_ids):
+                    if pid == out_id:
+                        session.team2_ids[i] = new_id
+                        break
+            session.result_votes.pop(out_id, None)
+            session.cancel_votes.discard(out_id)
+
+    out_member = await get_or_fetch_member(guild, out_id)
+    new_member = await get_or_fetch_member(guild, new_id)
+    vc_overwrite = discord.PermissionOverwrite(view_channel=True, connect=True, speak=True)
+
+    if session.phase == "lobby":
+        # Update lobby voice channel so the sub can see and join
+        if session.lobby_voice_channel_id is not None:
+            lobby_ch = guild.get_channel(session.lobby_voice_channel_id)
+            if isinstance(lobby_ch, discord.VoiceChannel):
+                try:
+                    if out_member is not None:
+                        await lobby_ch.set_permissions(out_member, overwrite=None)
+                    if new_member is not None:
+                        await lobby_ch.set_permissions(new_member, overwrite=vc_overwrite)
+                        if new_member.voice is not None and new_member.voice.channel is not None:
+                            try:
+                                await new_member.move_to(lobby_ch)
+                            except discord.Forbidden:
+                                pass
+                except discord.Forbidden:
+                    pass
+        await interaction.response.send_message(
+            f"Substitution: {new_player.mention} has replaced {out_player.mention}. "
+            f"They can join the lobby voice channel to continue.",
+        )
+        return
+
+    # in_match: update team voice channel overwrites and optionally move new player
+    if out_id in session.team1_ids:
+        team_num = 1
+        team_voice_id = session.team1_voice_channel_id
+    else:
+        team_num = 2
+        team_voice_id = session.team2_voice_channel_id
+
+    if team_voice_id is not None:
+        team_ch = guild.get_channel(team_voice_id)
+        if isinstance(team_ch, discord.VoiceChannel):
+            try:
+                if out_member is not None:
+                    await team_ch.set_permissions(out_member, overwrite=None)
+                if new_member is not None:
+                    await team_ch.set_permissions(new_member, overwrite=vc_overwrite)
+                    if new_member.voice is not None and new_member.voice.channel is not None:
+                        try:
+                            await new_member.move_to(team_ch)
+                        except discord.Forbidden:
+                            pass
+            except discord.Forbidden:
+                pass
+
+    await interaction.response.send_message(
+        f"Substitution: {new_player.mention} has replaced {out_player.mention} on Team {team_num}.",
+    )
 
 
 @bot.event
