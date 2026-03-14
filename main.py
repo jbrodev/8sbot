@@ -83,6 +83,8 @@ class MatchSession:
     cancel_vote_message_id: Optional[int] = None
     cancel_vote_started_ts: Optional[float] = None
 
+    selected_maps: Optional[list[str]] = None  # 3 random maps when draft completes; None until then
+
 
 @dataclass
 class QueueState:
@@ -217,6 +219,19 @@ def _queue_name_to_slug(name: Optional[str]) -> str:
         return "8s"
     s = name.strip().lower().replace(" queue", "").replace(" ", "")
     return s if s else "8s"
+
+
+# Eligible maps per game (slug from queue name); 3 random maps are picked when draft completes.
+GAME_MAPS: dict[str, list[str]] = {
+    "cod4": ["strike", "crash", "backlot", "district"],
+    "ghosts": ["warhawk", "octane", "freight", "sovereign"],
+    "bo1": ["Havana", "firing range", "grid", "Hanoi"],
+    "mwr": ["backlot", "crash", "strike"],
+    "mw2": ["highrise", "karachi", "terminal", "scrapyard", "invasion"],
+    "mw3": ["bootleg", "underground", "terminal", "hardhat", "arkaden"],
+    "waw": ["makin", "courtyard", "hangar", "upheaval", "castle"],
+    "bo2": ["raid", "standoff", "cargo", "express", "slums"],
+}
 
 
 def _next_match_slot(
@@ -1165,6 +1180,10 @@ async def apply_pick_and_advance(session_id: str, picked_id: int, autopick: bool
         done = session.pick_index >= len(session.pick_order) or not session.remaining_ids
         if done:
             session.phase = "in_match"
+            queue_state = QUEUE_STATES.get((session.guild_id, session.queue_text_channel_id))
+            slug = _queue_name_to_slug(queue_state.name if queue_state else None)
+            maps = GAME_MAPS.get(slug, [])
+            session.selected_maps = random.sample(maps, min(3, len(maps))) if maps else []
 
     match_text = guild.get_channel(session.match_text_channel_id)
     if not isinstance(match_text, discord.TextChannel):
@@ -1208,10 +1227,16 @@ async def apply_pick_and_advance(session_id: str, picked_id: int, autopick: bool
         return
 
     # Draft finished => create temp voice channels and move players.
+    maps_line = ""
+    if session.selected_maps:
+        maps_line = "\n**Maps:** " + ", ".join(f"Map {i + 1}: {m}" for i, m in enumerate(session.selected_maps)) + "\n\n"
+    else:
+        maps_line = "\n**Maps:** —\n\n"
     content = (
         f"🏁 Draft complete.\n"
         f"Team 1: {render_players(guild, session.team1_ids)}\n"
         f"Team 2: {render_players(guild, session.team2_ids)}\n\n"
+        f"{maps_line}"
         f"Creating team voice channels and moving players now…"
     )
     if msg is not None:
@@ -1306,10 +1331,14 @@ async def create_team_channels_and_move(session_id: str) -> None:
 
     match_text = guild.get_channel(session.match_text_channel_id)
     if isinstance(match_text, discord.TextChannel):
+        maps_blurb = ""
+        if session.selected_maps:
+            maps_blurb = f"Maps for this match: " + ", ".join(f"{i + 1}. {m}" for i, m in enumerate(session.selected_maps)) + "\n\n"
         await match_text.send(
             f"🎮 **Match started**\n"
             f"Team 1 VC: {team1_chan.mention}\n"
             f"Team 2 VC: {team2_chan.mention}\n\n"
+            f"{maps_blurb}"
             f"Only your team can see and join your team's voice channel. If you weren't moved automatically, join your team VC above.\n\n"
             f"When the match ends, click below to start the winner vote.",
             view=StartResultVoteView(session.session_id),
